@@ -7,12 +7,13 @@ import httpx
 
 IMAP_HOST     = os.environ["IMAP_HOST"]
 IMAP_PORT     = int(os.environ.get("IMAP_PORT","993"))
-SMTP_HOST     = os.environ["SMTP_HOST"]
+SMTP_HOST     = os.environ.get("SMTP_HOST","smtp.gmail.com")
 SMTP_PORT     = int(os.environ.get("SMTP_PORT","587"))
 MONITOR_EMAIL = os.environ["AIGPRE_EMAIL"]
 MONITOR_PASS  = os.environ["AIGPRE_PASS"]
+SMTP_USER     = os.environ.get("SMTP_USER","")
+SMTP_PASS     = os.environ.get("SMTP_PASS","")
 OPS_EMAIL     = os.environ["OPS_EMAIL"]
-OPS_PASS      = os.environ["OPS_PASS"]
 ANTHROPIC_KEY = os.environ["ANTHROPIC_API_KEY"]
 CHECK_INTERVAL= int(os.environ.get("CHECK_INTERVAL","120"))
 
@@ -24,9 +25,8 @@ When responding to inquiries:
 2. Confirm entry into AIGPRE qualification review
 3. Explain the 4-step process briefly
 4. State 48-hour review timeline
-5. Provide correct contact routing
-6. Institutional tone. Maximum 220 words.
-7. End with: AIGPRE Global Trade Platform | aigpre.com
+5. Institutional tone. Maximum 220 words.
+6. End with: AIGPRE Global Trade Platform | aigpre.com
 If spam or not genuine: respond IGNORE"""
 
 def decode_str(s):
@@ -51,7 +51,7 @@ def get_body(msg):
     return body[:3000].strip()
 
 def get_ai_reply(sender_email, sender_name, subject, body):
-    prompt = f"FROM: {sender_name} <{sender_email}>\nSUBJECT: {subject}\nMESSAGE:\n{body}\n\nDraft reply or respond IGNORE if not genuine."
+    prompt = f"FROM: {sender_name} <{sender_email}>\nSUBJECT: {subject}\nMESSAGE:\n{body}\n\nDraft professional reply or respond IGNORE if not genuine."
     try:
         r = httpx.post("https://api.anthropic.com/v1/messages",
             headers={"x-api-key": ANTHROPIC_KEY,"anthropic-version":"2023-06-01","content-type":"application/json"},
@@ -64,45 +64,24 @@ def get_ai_reply(sender_email, sender_name, subject, body):
     except Exception as e:
         print(f"[AI ERROR] {e}"); return None
 
-def smtp_send(login, password, from_addr, to_addr, subject, body):
+def smtp_send(to_addr, subject, body):
     msg = MIMEMultipart("alternative")
-    msg["From"]=from_addr; msg["To"]=to_addr; msg["Subject"]=subject
+    msg["From"] = f"AIGPRE Global Trade <{SMTP_USER}>"
+    msg["To"] = to_addr
+    msg["Subject"] = subject
+    msg["Reply-To"] = MONITOR_EMAIL
     msg.attach(MIMEText(body,"plain"))
     try:
-        # Try port 587 with STARTTLS first
-        if SMTP_PORT == 587:
-            with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as s:
-                s.ehlo()
-                s.starttls()
-                s.ehlo()
-                s.login(login, password)
-                s.sendmail(login, to_addr, msg.as_string())
-        else:
-            # Fall back to SSL for port 465
-            with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT) as s:
-                s.login(login, password)
-                s.sendmail(login, to_addr, msg.as_string())
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as s:
+            s.ehlo()
+            s.starttls()
+            s.ehlo()
+            s.login(SMTP_USER, SMTP_PASS)
+            s.sendmail(SMTP_USER, to_addr, msg.as_string())
         return True
     except Exception as e:
-        print(f"[SMTP ERROR port {SMTP_PORT}] {e}")
-        # Try alternative port
-        try:
-            alt_port = 465 if SMTP_PORT == 587 else 587
-            print(f"[SMTP] Retrying with port {alt_port}...")
-            if alt_port == 587:
-                with smtplib.SMTP(SMTP_HOST, alt_port) as s:
-                    s.ehlo(); s.starttls(); s.ehlo()
-                    s.login(login, password)
-                    s.sendmail(login, to_addr, msg.as_string())
-            else:
-                with smtplib.SMTP_SSL(SMTP_HOST, alt_port) as s:
-                    s.login(login, password)
-                    s.sendmail(login, to_addr, msg.as_string())
-            print(f"[SMTP] Success with port {alt_port}")
-            return True
-        except Exception as e2:
-            print(f"[SMTP ERROR alt port] {e2}")
-            return False
+        print(f"[SMTP ERROR] {e}")
+        return False
 
 def process_inbox():
     now = datetime.now(timezone.utc).strftime("%H:%M:%S")
@@ -113,7 +92,10 @@ def process_inbox():
         mail.select("INBOX")
         _, ids = mail.search(None, "UNSEEN")
         uid_list = ids[0].split()
-        if not uid_list: print("  No new messages."); mail.logout(); return
+        if not uid_list:
+            print("  No new messages.")
+            mail.logout()
+            return
         print(f"  {len(uid_list)} new message(s).")
         for uid in uid_list:
             _, data = mail.fetch(uid, "(RFC822)")
@@ -127,19 +109,22 @@ def process_inbox():
             else:
                 sender_email = sender_raw; sender_name = sender_raw
             print(f"  → {sender_name} <{sender_email}> | {subject[:50]}")
-            if any(x in sender_email.lower() for x in [MONITOR_EMAIL.lower(), OPS_EMAIL.lower()]):
-                print("  Skipped — internal."); mail.store(uid,"+FLAGS","\\Seen"); continue
+            skip = [MONITOR_EMAIL.lower(), OPS_EMAIL.lower(), SMTP_USER.lower(), "mailer-daemon", "postmaster"]
+            if any(x in sender_email.lower() for x in skip):
+                print("  Skipped — internal.")
+                mail.store(uid,"+FLAGS","\\Seen")
+                continue
             reply = get_ai_reply(sender_email, sender_name, subject, body)
             if not reply or reply.strip().upper().startswith("IGNORE"):
-                print("  Not genuine — skipped."); mail.store(uid,"+FLAGS","\\Seen"); continue
-            sent = smtp_send(MONITOR_EMAIL, MONITOR_PASS,
-                f"AIGPRE Global Trade <{MONITOR_EMAIL}>", sender_email, f"Re: {subject}", reply)
+                print("  Not genuine — skipped.")
+                mail.store(uid,"+FLAGS","\\Seen")
+                continue
+            sent = smtp_send(sender_email, f"Re: {subject}", reply)
             if sent: print(f"  ✅ AI reply sent → {sender_email}")
+            else: print(f"  ❌ SMTP failed")
             now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-            notification = f"AIGPRE NEW INQUIRY\nFROM: {sender_name}\nEMAIL: {sender_email}\nSUBJECT: {subject}\nTIME: {now_str}\n\nORIGINAL:\n{body[:800]}\n\nAI REPLY SENT:\n{reply}\n\nACTION: Review and decide if qualification should proceed.\nAIGPRE Trade Intelligence | aigpre.com"
-            smtp_send(OPS_EMAIL, OPS_PASS,
-                f"AIGPRE System <{OPS_EMAIL}>", OPS_EMAIL,
-                f"[NEW INQUIRY] {sender_name} — {subject[:50]}", notification)
+            notif = f"AIGPRE NEW INQUIRY\nFROM: {sender_name}\nEMAIL: {sender_email}\nSUBJECT: {subject}\nTIME: {now_str}\n\nORIGINAL:\n{body[:800]}\n\nAI REPLY:\n{reply}\n\nACTION: Review and decide next steps.\nAIGPRE Trade Intelligence | aigpre.com"
+            smtp_send(OPS_EMAIL, f"[NEW INQUIRY] {sender_name} — {subject[:50]}", notif)
             print(f"  ✅ Ops notified → {OPS_EMAIL}")
             mail.store(uid,"+FLAGS","\\Seen")
         mail.logout()
@@ -148,8 +133,9 @@ def process_inbox():
 
 if __name__ == "__main__":
     print("AIGPRE Email AI — Railway Production")
-    print(f"Monitor: {MONITOR_EMAIL} | Ops: {OPS_EMAIL}")
-    print(f"SMTP: {SMTP_HOST}:{SMTP_PORT}")
+    print(f"Monitor : {MONITOR_EMAIL}")
+    print(f"SMTP    : {SMTP_HOST}:{SMTP_PORT} via {SMTP_USER}")
+    print(f"Ops     : {OPS_EMAIL}")
     cycle = 0
     while True:
         cycle += 1
